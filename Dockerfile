@@ -13,10 +13,12 @@ COPY package*.json ./
 # Install the server dependencies (only Express is needed)
 RUN npm install
 
-# Copy the server logic
+# Copy the server logic and the command builder
 COPY server.js .
+COPY ffmpeg-builder.js . 
+# This line is the critical fix for the Docker image!
 
-# The server will run on port 3000 by default (standard for these platforms)
+# The server will run on port 3000 by default
 EXPOSE 3000
 
 # Start the server
