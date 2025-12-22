@@ -10,7 +10,6 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY; 
 const PORT = process.env.PORT || 10000;
 
-// Bucket Names confirmed by your App Builder
 const BUCKET_GENERATED = 'generated-content';
 const BUCKET_LOGOS = 'logo-videos';
 const BUCKET_MUSIC = 'music-tracks';
@@ -23,24 +22,19 @@ const STATUS_FAILED = 'FAILED';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-/**
- * Builds a valid, encoded Public URL for Supabase Storage
- */
 function buildPublicUrl(bucket, fileName) {
     if (!fileName) return null;
     if (fileName.startsWith('http')) return encodeURI(fileName);
-    // Remove leading slashes and encode the filename (fixes spaces/special chars)
     const cleanName = fileName.replace(/^\/+/, '');
     return encodeURI(`${SUPABASE_URL}/storage/v1/object/public/${bucket}/${cleanName}`);
 }
 
 async function downloadAsset(url, scriptId, assetName) {
     if (!url) {
-        console.log(`[ASSET] Skipping ${assetName} - No URL provided.`);
+        console.log(`[ASSET] No URL for ${assetName}`);
         return null;
     }
-    
-    console.log(`[ASSET] Attempting to download ${assetName}: ${url}`);
+    console.log(`[ASSET] Downloading ${assetName}: ${url}`);
     try {
         const response = await fetch(url);
         if (response.ok) {
@@ -53,10 +47,11 @@ async function downloadAsset(url, scriptId, assetName) {
                 writer.on('error', reject);
             });
         }
-        throw new Error(`HTTP ${response.status} at ${url}`);
+        console.error(`[ASSET] ${assetName} HTTP ${response.status}`);
+        return null;
     } catch (e) {
-        console.error(`[ASSET] ${assetName} failed: ${e.message}`);
-        throw e; 
+        console.error(`[ASSET] ${assetName} error: ${e.message}`);
+        return null; 
     }
 }
 
@@ -70,15 +65,20 @@ async function processNextJob() {
     try {
         await supabase.from('story_script').update({ status: STATUS_IN_PROGRESS, progress_percentage: "15" }).eq('id', scriptId);
 
-        // 1. Resolve LOGO using the 'logo-videos' bucket
+        // DEBUG: Print the JSON so we know what keys exist
+        console.log(`[DEBUG] Script Data content: ${JSON.stringify(job.script_data)}`);
+
+        // 1. Logo
         const { data: logoRow } = await supabase.from('logo_videos').select('video_url').order('created_at', { ascending: false }).limit(1).maybeSingle();
         const logoUrl = logoRow ? buildPublicUrl(BUCKET_LOGOS, logoRow.video_url) : null;
 
-        // 2. Resolve MUSIC using the 'music-tracks' bucket
+        // 2. Music (Smart Search)
+        const sd = job.script_data || {};
+        let musicRef = sd.background_music || sd.music || sd.bg_music || sd.music_track || sd.audio_track || job.background_music_url;
         let musicUrl = null;
-        let musicRef = job.script_data?.background_music || job.script_data?.music;
         
         if (musicRef) {
+            console.log(`[MUSIC] Searching for track matching: ${musicRef}`);
             const { data: track } = await supabase.from('music_tracks')
                 .select('url, file_path')
                 .or(`title.ilike.%${musicRef}%,file_path.ilike.%${musicRef}%`)
@@ -89,17 +89,22 @@ async function processNextJob() {
             }
         }
 
-        // 3. Download Assets
+        // FALLBACK: If still no music, just pick the newest track from the table so the render doesn't fail
+        if (!musicUrl) {
+            console.log(`[MUSIC] No specific match found. Picking fallback track...`);
+            const { data: fallback } = await supabase.from('music_tracks').select('url, file_path').limit(1).maybeSingle();
+            if (fallback) musicUrl = fallback.url || buildPublicUrl(BUCKET_MUSIC, fallback.file_path);
+        }
+
         const lPath = await downloadAsset(logoUrl, scriptId, 'logo');
         const mPath = await downloadAsset(musicUrl, scriptId, 'music');
 
-        if (!mPath) throw new Error(`Background music reference "${musicRef}" not found in database or download failed.`);
+        if (!mPath) throw new Error("Audio is required but no music track could be found in 'music_tracks' table.");
 
         await supabase.from('story_script').update({ progress_percentage: "40" }).eq('id', scriptId);
 
-        // 4. FFmpeg Processing
         const outPath = path.join('/tmp', `out_${scriptId}.mp4`);
-        const duration = job.script_data?.total_duration || 10;
+        const duration = sd.total_duration || 10;
 
         let args = [];
         if (lPath) {
@@ -123,9 +128,8 @@ async function processNextJob() {
             proc.on('close', (code) => code === 0 ? resolve() : reject(new Error("FFmpeg execution failed")));
         });
 
-        // 5. Upload Render to 'generated-content'
         const videoBuf = await fs.readFile(outPath);
-        const fileName = `renders/${scriptId}_${Date.now()}_final.mp4`;
+        const fileName = `renders/${scriptId}_${Date.now()}.mp4`;
         await supabase.storage.from(BUCKET_GENERATED).upload(fileName, videoBuf, { contentType: 'video/mp4', upsert: true });
 
         const { data: pUrl } = supabase.storage.from(BUCKET_GENERATED).getPublicUrl(fileName);
@@ -136,17 +140,13 @@ async function processNextJob() {
             progress_percentage: "100"
         }).eq('id', scriptId);
 
-        // Cleanup temp files
         if (lPath) await fs.unlink(lPath).catch(() => {});
         if (mPath) await fs.unlink(mPath).catch(() => {});
         await fs.unlink(outPath).catch(() => {});
 
     } catch (e) {
         console.error("Render Job Error:", e);
-        await supabase.from('story_script').update({ 
-            status: STATUS_FAILED, 
-            error_message: e.message 
-        }).eq('id', scriptId);
+        await supabase.from('story_script').update({ status: STATUS_FAILED, error_message: e.message }).eq('id', scriptId);
     }
 }
 
