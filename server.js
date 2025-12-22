@@ -5,6 +5,7 @@ const { promises: fs } = require('fs');
 const path = require('path');
 const fetch = require('node-fetch'); 
 
+// --- Configuration ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY; 
 const PORT = process.env.PORT || 10000;
@@ -23,32 +24,32 @@ const LOGO_VIDEO_DURATION_SECONDS = 5;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 /**
- * Helper to turn a filename or partial path into a full Supabase URL
+ * Encodes a URL safely and builds the path if only a filename is provided
  */
-function getFullUrl(input) {
+function getSafeUrl(input) {
     if (!input) return null;
-    if (input.startsWith('http')) return input;
-    // If it's just a filename, point it to the generated-content bucket
-    return `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_STORAGE_BUCKET}/${input}`;
+    let fullUrl = input;
+    if (!input.startsWith('http')) {
+        // Default to generated-content bucket if just a filename
+        fullUrl = `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_STORAGE_BUCKET}/${input}`;
+    }
+    return encodeURI(fullUrl);
 }
 
 async function downloadAsset(url, scriptId, assetName) {
-    const fullUrl = getFullUrl(url);
-    if (!fullUrl) {
-        console.log(`[ASSET] Skipping ${assetName} - No URL provided.`);
+    const safeUrl = getSafeUrl(url);
+    if (!safeUrl) return null;
+    
+    console.log(`[ASSET] Downloading ${assetName} from: ${safeUrl}`);
+    const response = await fetch(safeUrl);
+    
+    if (!response.ok) {
+        console.error(`[ASSET] Failed to fetch ${assetName}: ${response.status} ${response.statusText}`);
         return null;
     }
     
-    const urlObject = new URL(fullUrl);
-    let extension = path.extname(urlObject.pathname) || (assetName.includes('music') ? '.mp3' : '.mp4');
-    const tempFilePath = path.join('/tmp', `${assetName}_${scriptId}${extension}`);
-
-    console.log(`[ASSET] Downloading ${assetName} from: ${fullUrl}`);
-    const response = await fetch(fullUrl);
-    if (!response.ok) {
-        console.error(`[ASSET] Failed to fetch ${assetName}: ${response.statusText}`);
-        return null;
-    }
+    const extension = assetName.includes('music') ? '.mp3' : '.mp4';
+    const tempFilePath = path.join('/tmp', `${assetName}_${scriptId}_${Date.now()}${extension}`);
     
     const writer = require('fs').createWriteStream(tempFilePath);
     response.body.pipe(writer);
@@ -63,7 +64,7 @@ async function updateJobStatus(scriptId, status, progress, errorMsg = null, vide
     const payload = { 
         status, 
         progress_percentage: progress.toString(), 
-        error_message: errorMsg, 
+        error_message: errorMsg ? errorMsg.substring(0, 500) : null, 
         final_video_url: videoUrl 
     };
     await supabase.from(SUPABASE_TABLE_NAME).update(payload).eq('id', scriptId);
@@ -72,12 +73,10 @@ async function updateJobStatus(scriptId, status, progress, errorMsg = null, vide
 
 async function runFFmpeg(job, logoPath, musicPath) {
     const scriptId = job.id;
-    const videoData = job.script_data || {};
-    const movieDuration = videoData.total_duration || 20; 
-    const tempOutput = path.join('/tmp', `final_${scriptId}.mp4`);
+    const movieDuration = job.script_data?.total_duration || 20; 
+    const tempOutput = path.join('/tmp', `final_${scriptId}_${Date.now()}.mp4`);
 
     let args = [];
-
     if (logoPath) {
         const totalDuration = movieDuration + LOGO_VIDEO_DURATION_SECONDS;
         args = [
@@ -115,41 +114,59 @@ async function processNextJob() {
     try {
         await updateJobStatus(job.id, STATUS_IN_PROGRESS, 10);
 
+        // --- 1. RESOLVE LOGO ---
         let logoUrl = null;
-        
-        // 1. Try to find user-specific logo
         if (job.user_id) {
-            const { data: logoData } = await supabase.from('logo_videos').select('video_url').eq('user_id', job.user_id).maybeSingle();
-            if (logoData) logoUrl = logoData.video_url;
+            const { data } = await supabase.from('logo_videos').select('video_url').eq('user_id', job.user_id).maybeSingle();
+            if (data) logoUrl = data.video_url;
         }
-
-        // 2. Fallback: Get the most recent logo from logo_videos table if user logo is missing
         if (!logoUrl) {
-            const { data: latestLogo } = await supabase.from('logo_videos').select('video_url').order('created_at', { ascending: false }).limit(1).maybeSingle();
-            if (latestLogo) logoUrl = latestLogo.video_url;
+            const { data } = await supabase.from('logo_videos').select('video_url').order('created_at', { ascending: false }).limit(1).maybeSingle();
+            if (data) logoUrl = data.video_url;
         }
 
-        // 3. Fallback: Check script_data
-        if (!logoUrl && job.script_data?.logo_video) {
-            logoUrl = job.script_data.logo_video;
-        }
+        // --- 2. RESOLVE MUSIC (Search music_tracks table) ---
+        let musicUrl = job.script_data?.background_music;
         
-        const musicUrl = job.script_data?.background_music;
+        // If the background_music field is just an ID or name, look it up in the music_tracks table
+        if (musicUrl && !musicUrl.startsWith('http')) {
+            console.log(`[MUSIC] Looking up track details for: ${musicUrl}`);
+            const { data: trackData } = await supabase
+                .from('music_tracks')
+                .select('file_path, url')
+                .or(`title.eq."${musicUrl}",file_path.eq."${musicUrl}"`)
+                .maybeSingle();
+            
+            if (trackData) {
+                musicUrl = trackData.url || trackData.file_path;
+                // If it's a file path, we might need to build the bucket URL
+                if (musicUrl && !musicUrl.startsWith('http')) {
+                    musicUrl = `${SUPABASE_URL}/storage/v1/object/public/music-tracks/${musicUrl}`;
+                }
+            }
+        }
 
+        // --- 3. DOWNLOAD ---
         const lPath = await downloadAsset(logoUrl, job.id, 'logo');
         const mPath = await downloadAsset(musicUrl, job.id, 'music');
 
-        if (!mPath) throw new Error("Background music track not found in job data.");
+        if (!mPath) throw new Error("Could not download background music from music_tracks table.");
 
-        await updateJobStatus(job.id, STATUS_IN_PROGRESS, 40);
+        await updateJobStatus(job.id, STATUS_IN_PROGRESS, 50);
+        
         const finalPath = await runFFmpeg(job, lPath, mPath);
 
         const videoBuf = await fs.readFile(finalPath);
-        const storagePath = `public/renders/${job.id}_${Date.now()}.mp4`;
+        const storagePath = `public/renders/final_${job.id}_${Date.now()}.mp4`;
         await supabase.storage.from(SUPABASE_STORAGE_BUCKET).upload(storagePath, videoBuf, { contentType: 'video/mp4', upsert: true });
 
         const { data: pUrl } = supabase.storage.from(SUPABASE_STORAGE_BUCKET).getPublicUrl(storagePath);
         await updateJobStatus(job.id, STATUS_COMPLETED, 100, null, pUrl.publicUrl);
+
+        // Clean up
+        if (lPath) await fs.unlink(lPath).catch(() => {});
+        await fs.unlink(mPath).catch(() => {});
+        await fs.unlink(finalPath).catch(() => {});
 
     } catch (e) {
         console.error("Job Error:", e);
@@ -159,8 +176,7 @@ async function processNextJob() {
 
 const app = express();
 app.use(express.json());
-app.post('/render', (req, res) => res.status(202).send());
-app.post('/process', (req, res) => res.status(202).send());
+app.post(['/render', '/process'], (req, res) => res.status(202).send({ status: "accepted" }));
 
 app.listen(PORT, () => {
     console.log(`Server live on port ${PORT}`);
