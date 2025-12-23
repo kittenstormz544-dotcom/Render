@@ -82,26 +82,32 @@ async function processNextJob() {
         let inputs = [];
         let filter = "";
 
-        // Build Video Source
+        // SOURCE 0: Logo (if exists)
         if (lPath) {
             inputs.push('-i', lPath);
-            inputs.push('-f', 'lavfi', '-i', `color=c=black:s=1280x720:d=${duration}`);
-            filter += "[0:v][1:v]concat=n=2:v=1:a=0[v_out];";
-        } else {
-            inputs.push('-f', 'lavfi', '-i', `color=c=black:s=1280x720:d=${duration}`);
-            filter += "[0:v]copy[v_out];";
         }
 
-        // Build Audio Source
+        // SOURCE 1: Main background (Black color)
+        inputs.push('-f', 'lavfi', '-i', `color=c=black:s=1280x720:d=${duration}`);
+
+        // SOURCE 2: Audio (Music or Silence)
         if (mPath) {
             inputs.push('-i', mPath);
-            // Audio index is the next one available
-            const aIdx = lPath ? 2 : 1;
-            filter += `[${aIdx}:a]atrim=0:${duration + 5},afade=t=out:st=${duration + 4}:d=1[a_out]`;
         } else {
             inputs.push('-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo:d=${duration + 5}`);
-            const aIdx = lPath ? 2 : 1;
-            filter += `[${aIdx}:a]copy[a_out]`;
+        }
+
+        // Complex Filter Logic
+        if (lPath) {
+            // Concatenate Logo (0:v) and Background (1:v)
+            filter += "[0:v][1:v]concat=n=2:v=1:a=0[v_out];";
+            // Map Audio from input 2 (Music/Silence)
+            filter += "[2:a]atrim=0,afade=t=out:st="+(duration+duration/2)+":d=1[a_out]";
+        } else {
+            // No logo, just use Background (0:v)
+            filter += "[0:v]copy[v_out];";
+            // Map Audio from input 1 (Music/Silence)
+            filter += "[1:a]atrim=0,afade=t=out:st="+(duration-1)+":d=1[a_out]";
         }
 
         const args = [
@@ -111,6 +117,7 @@ async function processNextJob() {
             '-map', '[a_out]',
             '-c:v', 'libx264',
             '-pix_fmt', 'yuv420p',
+            '-preset', 'ultrafast',
             '-c:a', 'aac',
             '-shortest',
             '-y',
@@ -120,13 +127,13 @@ async function processNextJob() {
         console.log(`[FFMPEG] Executing...`);
         await new Promise((resolve, reject) => {
             const proc = spawn('ffmpeg', args);
-            proc.stderr.on('data', (data) => console.log(`[FFMPEG LOG] ${data}`));
+            proc.stderr.on('data', (data) => console.log(`[FFMPEG LOG] ${data.toString()}`));
             proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`FFmpeg Failed Code ${code}`)));
         });
 
         // 3. Upload Result
         const videoBuf = await fs.readFile(outPath);
-        const fileName = `renders/${scriptId}_${Date.now()}.mp4`;
+        const fileName = `renders/${scriptId}_final.mp4`;
         await supabase.storage.from(BUCKET_GENERATED).upload(fileName, videoBuf, { contentType: 'video/mp4', upsert: true });
 
         const { data: pUrl } = supabase.storage.from(BUCKET_GENERATED).getPublicUrl(fileName);
