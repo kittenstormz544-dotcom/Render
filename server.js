@@ -56,17 +56,15 @@ async function processNextJob() {
     
     try {
         await supabase.from('story_script').update({ status: STATUS_IN_PROGRESS }).eq('id', scriptId);
-
         console.log(`[DEBUG] Script Data: ${JSON.stringify(job.script_data)}`);
 
-        // 1. Resolve Logo
+        // 1. Resolve Assets
         const { data: logoRow } = await supabase.from('logo_videos').select('video_url').order('created_at', { ascending: false }).limit(1).maybeSingle();
         const logoUrl = logoRow ? buildPublicUrl(BUCKET_LOGOS, logoRow.video_url) : null;
 
-        // 2. Resolve Music
         let musicUrl = null;
         const sd = job.script_data || {};
-        const musicRef = sd.background_music || sd.music || job.background_music_url;
+        const musicRef = sd.background_music || sd.music;
         
         if (musicRef) {
             const { data: track } = await supabase.from('music_tracks').select('url, file_path')
@@ -74,52 +72,70 @@ async function processNextJob() {
             if (track) musicUrl = track.url || buildPublicUrl(BUCKET_MUSIC, track.file_path);
         }
 
-        // If no music found by title, try picking ANY track
-        if (!musicUrl) {
-            const { data: anyTrack } = await supabase.from('music_tracks').select('url, file_path').limit(1).maybeSingle();
-            if (anyTrack) musicUrl = anyTrack.url || buildPublicUrl(BUCKET_MUSIC, anyTrack.file_path);
-        }
-
         const lPath = await downloadAsset(logoUrl, scriptId, 'logo');
         const mPath = await downloadAsset(musicUrl, scriptId, 'music');
 
-        // 3. FFmpeg with Silence Fallback
+        // 2. FFmpeg Command Construction
         const outPath = path.join('/tmp', `out_${scriptId}.mp4`);
         const duration = sd.total_duration || 10;
         
-        let args = [];
-        // Audio input: Use mPath if exists, otherwise generate silence
-        const audioInput = mPath ? ['-i', mPath] : ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'];
-        const audioMap = mPath ? '2:a' : '2:a'; // Map from the audio input index
+        let inputs = [];
+        let filter = "";
 
+        // Build Video Source
         if (lPath) {
-            args = [
-                '-i', lPath,
-                '-f', 'lavfi', '-i', `color=c=black:s=1280x720:d=${duration}`,
-                ...audioInput,
-                '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[vv]',
-                '-map', '[vv]', '-map', audioMap, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', '-y', outPath
-            ];
+            inputs.push('-i', lPath);
+            inputs.push('-f', 'lavfi', '-i', `color=c=black:s=1280x720:d=${duration}`);
+            filter += "[0:v][1:v]concat=n=2:v=1:a=0[v_out];";
         } else {
-            args = [
-                '-f', 'lavfi', '-i', `color=c=black:s=1280x720:d=${duration}`,
-                ...audioInput,
-                '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', '-y', outPath
-            ];
+            inputs.push('-f', 'lavfi', '-i', `color=c=black:s=1280x720:d=${duration}`);
+            filter += "[0:v]copy[v_out];";
         }
 
+        // Build Audio Source
+        if (mPath) {
+            inputs.push('-i', mPath);
+            // Audio index is the next one available
+            const aIdx = lPath ? 2 : 1;
+            filter += `[${aIdx}:a]atrim=0:${duration + 5},afade=t=out:st=${duration + 4}:d=1[a_out]`;
+        } else {
+            inputs.push('-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo:d=${duration + 5}`);
+            const aIdx = lPath ? 2 : 1;
+            filter += `[${aIdx}:a]copy[a_out]`;
+        }
+
+        const args = [
+            ...inputs,
+            '-filter_complex', filter,
+            '-map', '[v_out]',
+            '-map', '[a_out]',
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-shortest',
+            '-y',
+            outPath
+        ];
+
+        console.log(`[FFMPEG] Executing...`);
         await new Promise((resolve, reject) => {
-            const proc = spawn('ffmpeg', args.flat());
-            proc.on('close', (code) => code === 0 ? resolve() : reject(new Error("FFmpeg failed")));
+            const proc = spawn('ffmpeg', args);
+            proc.stderr.on('data', (data) => console.log(`[FFMPEG LOG] ${data}`));
+            proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`FFmpeg Failed Code ${code}`)));
         });
 
-        // 4. Upload
+        // 3. Upload Result
         const videoBuf = await fs.readFile(outPath);
-        const fileName = `renders/${scriptId}_final.mp4`;
+        const fileName = `renders/${scriptId}_${Date.now()}.mp4`;
         await supabase.storage.from(BUCKET_GENERATED).upload(fileName, videoBuf, { contentType: 'video/mp4', upsert: true });
 
         const { data: pUrl } = supabase.storage.from(BUCKET_GENERATED).getPublicUrl(fileName);
         await supabase.from('story_script').update({ status: STATUS_COMPLETED, final_video_url: pUrl.publicUrl }).eq('id', scriptId);
+
+        // Cleanup
+        if (lPath) fs.unlink(lPath).catch(() => {});
+        if (mPath) fs.unlink(mPath).catch(() => {});
+        fs.unlink(outPath).catch(() => {});
 
     } catch (e) {
         console.error("Render Job Error:", e);
@@ -129,4 +145,7 @@ async function processNextJob() {
 
 const app = express();
 app.post(['/render', '/process'], (req, res) => res.sendStatus(202));
-app.listen(PORT, () => setInterval(processNextJob, POLLING_INTERVAL_MS));
+app.listen(PORT, () => {
+    console.log(`Render Engine active on ${PORT}`);
+    setInterval(processNextJob, POLLING_INTERVAL_MS);
+});
