@@ -5,7 +5,6 @@ const { promises: fs } = require('fs');
 const path = require('path');
 const fetch = require('node-fetch'); 
 
-// --- Configuration ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY; 
 const PORT = process.env.PORT || 10000;
@@ -28,20 +27,17 @@ function ensureFullUrl(input, bucket) {
 
 async function downloadAsset(url, scriptId, assetName) {
     if (!url) return null;
-    console.log(`[ASSET] Attempting: ${assetName} -> ${url}`);
     try {
         const response = await fetch(url);
         if (response.ok) {
             const ext = assetName === 'music' ? '.mp3' : '.mp4';
             const tempPath = path.join('/tmp', `${assetName}_${scriptId}_${Date.now()}${ext}`);
-            const writer = require('fs').createWriteStream(tempPath);
-            response.body.pipe(writer);
-            return new Promise((resolve) => {
-                writer.on('finish', () => resolve(tempPath));
-                writer.on('error', () => resolve(null));
-            });
+            const buffer = await response.arrayBuffer();
+            await fs.writeFile(tempPath, Buffer.from(buffer));
+            console.log(`[ASSET] Downloaded ${assetName} to ${tempPath}`);
+            return tempPath;
         }
-    } catch (e) { console.error(`[ASSET] Error: ${e.message}`); }
+    } catch (e) { console.error(`[ASSET] ${assetName} Error: ${e.message}`); }
     return null;
 }
 
@@ -57,12 +53,13 @@ async function processNextJob() {
     const scriptId = job.id;
     
     try {
-        await supabase.from('story_script').update({ status: 'PROCESSING_RENDER', progress_percentage: "15" }).eq('id', scriptId);
+        console.log(`[JOB] Processing ID: ${scriptId}`);
+        // Immediately set to PROCESSING so other instances don't grab it
+        await supabase.from('story_script').update({ status: 'PROCESSING_RENDER', progress_percentage: "20" }).eq('id', scriptId);
+
         let sd = job.script_data;
         if (typeof sd === 'string') { try { sd = JSON.parse(sd); } catch(e) { sd = {}; } }
         sd = sd || {};
-
-        console.log(`[JOB] Starting ID: ${scriptId}`);
 
         const { data: logoRow } = await supabase.from('logo_videos').select('video_url').order('created_at', { ascending: false }).limit(1).maybeSingle();
         const logoUrl = ensureFullUrl(logoRow?.video_url || sd.logo_video, BUCKET_LOGOS);
@@ -71,7 +68,7 @@ async function processNextJob() {
         const lPath = await downloadAsset(logoUrl, scriptId, 'logo');
         const mPath = await downloadAsset(musicUrl, scriptId, 'music');
 
-        const outPath = path.join('/tmp', `final_render_${scriptId}.mp4`);
+        const outPath = path.join('/tmp', `render_${scriptId}.mp4`);
         const duration = sd.total_duration || 10;
         
         let inputs = [];
@@ -93,37 +90,64 @@ async function processNextJob() {
 
         const args = [...inputs, '-filter_complex', filter, '-map', '[v_out]', '-map', '[a_out]', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', '-y', outPath];
 
+        console.log(`[FFMPEG] Starting render for ${scriptId}...`);
         await new Promise((resolve, reject) => {
             const proc = spawn('ffmpeg', args);
-            proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`FFmpeg Failed Code ${code}`)));
+            proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`FFmpeg error ${code}`)));
         });
 
+        console.log(`[STORAGE] Uploading to bucket: ${BUCKET_GENERATED}...`);
         const videoBuf = await fs.readFile(outPath);
-        const fileName = `renders/${scriptId}_final_${Date.now()}.mp4`;
-        await supabase.storage.from(BUCKET_GENERATED).upload(fileName, videoBuf, { contentType: 'video/mp4', upsert: true });
+        const fileName = `${scriptId}_final_${Date.now()}.mp4`;
+        
+        const { error: uploadError } = await supabase.storage.from(BUCKET_GENERATED).upload(fileName, videoBuf, { contentType: 'video/mp4', upsert: true });
+        
+        if (uploadError) {
+            console.error(`[STORAGE ERROR] ${uploadError.message}`);
+            throw new Error(`Upload failed: ${uploadError.message}`);
+        }
 
+        console.log(`[DB] Marking job as COMPLETED...`);
         const { data: pUrl } = supabase.storage.from(BUCKET_GENERATED).getPublicUrl(fileName);
-        await supabase.from('story_script').update({ status: 'COMPLETED', final_video_url: pUrl.publicUrl, progress_percentage: "100" }).eq('id', scriptId);
+        
+        const { error: updateError } = await supabase.from('story_script').update({ 
+            status: 'COMPLETED', 
+            final_video_url: pUrl.publicUrl, 
+            progress_percentage: "100" 
+        }).eq('id', scriptId);
+        
+        if (updateError) {
+            console.error(`[DB ERROR] ${updateError.message}`);
+            throw new Error(`DB Update failed: ${updateError.message}`);
+        }
 
-        console.log(`[JOB] Finished Render for ID: ${scriptId}`);
+        console.log(`[SUCCESS] Job ${scriptId} finished successfully.`);
+        
+        // Cleanup temp files
         if (lPath) await fs.unlink(lPath).catch(() => {});
         if (mPath) await fs.unlink(mPath).catch(() => {});
         await fs.unlink(outPath).catch(() => {});
+
     } catch (e) {
-        console.error("Render Job Error:", e);
-        await supabase.from('story_script').update({ status: 'FAILED', error_message: e.message }).eq('id', scriptId);
+        console.error(`[FATAL ERROR] Job ${scriptId}:`, e.message);
+        // Try to report the failure to Supabase so it doesn't stay in "Processing" forever
+        await supabase.from('story_script').update({ 
+            status: 'FAILED', 
+            error_message: e.message 
+        }).eq('id', scriptId);
     }
 }
 
 const app = express();
 app.use(express.json());
 
-// THIS IS THE FIX: Send a JSON object instead of the word "Accepted"
+// Handle the trigger from Supabase functions
 app.post(['/render', '/process'], (req, res) => {
-    res.status(202).json({ message: "Accepted", status: "processing" });
+    res.status(202).json({ status: "queued", message: "Render engine is processing jobs" });
 });
 
 app.listen(PORT, () => {
     console.log(`Render Engine active on port ${PORT}`);
+    // Check for jobs every 5 seconds
     setInterval(processNextJob, 5000);
 });
