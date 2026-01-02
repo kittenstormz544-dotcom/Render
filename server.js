@@ -67,28 +67,28 @@ async function processJob(scriptId) {
     activeJobs.add(scriptId);
 
     try {
-        const { data: initialJob } = await supabase.from('story_script').select('*').eq('id', scriptId).single();
-        if (!initialJob) throw new Error("Job not found");
-
+        console.log(`[STORY MODE] Processing Script: ${scriptId}`);
         await supabase.from('story_script').update({ status: 'PROCESSING_RENDER', progress_percentage: "40" }).eq('id', scriptId);
 
-        let job = initialJob;
+        let job = null;
         let retries = 0;
-        // Wait up to 10 minutes (100 * 6s) for AI to finish ALL scenes
-        while (retries < 100) { 
+        
+        while (retries < 90) { 
             const { data } = await supabase.from('story_script').select('*').eq('id', scriptId).single();
             let parsed = typeof data.script_data === 'string' ? JSON.parse(data.script_data) : data.script_data;
+            const readyClips = parsed?.scenes?.filter(s => s.video_url) || [];
             
-            // Check if we have scenes and if they ALL have URLs
-            if (parsed && parsed.scenes && parsed.scenes.length > 1 && parsed.scenes.every(s => s.video_url)) {
+            if (readyClips.length > 0 && readyClips.length === (parsed?.scenes?.length || 0)) {
                 job = { ...data, parsed_data: parsed };
-                console.log(`[RENDER READY] Found ${parsed.scenes.length} scenes. Starting render...`);
+                console.log(`[READY] All ${readyClips.length} scenes found.`);
                 break;
             }
-            console.log(`[WAITING] AI is still generating scenes (current count: ${parsed?.scenes?.filter(s => s.video_url).length || 0})...`);
-            await new Promise(r => setTimeout(r, 6000));
+            console.log(`[WAITING] AI is generating clips (${readyClips.length}/${parsed?.scenes?.length || '?'})...`);
+            await new Promise(r => setTimeout(r, 10000));
             retries++;
         }
+
+        if (!job) throw new Error("Processing timeout or no clips found.");
 
         const rawPaths = [];
         const sd = job.parsed_data;
@@ -96,8 +96,9 @@ async function processJob(scriptId) {
         const lPath = await downloadAsset(ensureFullUrl(sd?.logo_video, BUCKET_LOGOS), scriptId, 'logo');
         if (lPath) rawPaths.push(lPath);
 
-        for (let i = 0; i < (sd.scenes?.length || 0); i++) {
-            const sPath = await downloadAsset(ensureFullUrl(sd.scenes[i].video_url, BUCKET_SCENES), scriptId, `scene_${i}`);
+        const scenes = sd.scenes.filter(s => s.video_url);
+        for (let i = 0; i < scenes.length; i++) {
+            const sPath = await downloadAsset(ensureFullUrl(scenes[i].video_url, BUCKET_SCENES), scriptId, `scene_${i}`);
             if (sPath) rawPaths.push(sPath);
         }
 
@@ -153,14 +154,14 @@ async function processJob(scriptId) {
         const { data: pUrl } = supabase.storage.from(BUCKET_GENERATED).getPublicUrl(finalFileName);
         await supabase.from('story_script').update({ status: 'COMPLETED', final_video_url: pUrl.publicUrl, progress_percentage: "100" }).eq('id', scriptId);
 
-        console.log(`[SUCCESS] Full Movie Uploaded: ${pUrl.publicUrl}`);
+        console.log(`[SUCCESS] Full Movie Ready: ${pUrl.publicUrl}`);
 
         for (const p of [...rawPaths, ...processedPaths]) await fs.unlink(p).catch(() => {});
         if (mPath) await fs.unlink(mPath).catch(() => {});
         await fs.unlink(outPath).catch(() => {});
 
     } catch (e) {
-        console.error(`[ERROR]`, e.message);
+        console.error(`[ERROR Script ${scriptId}]`, e.message);
         await supabase.from('story_script').update({ status: 'FAILED', error_message: e.message }).eq('id', scriptId);
     } finally {
         activeJobs.delete(scriptId);
