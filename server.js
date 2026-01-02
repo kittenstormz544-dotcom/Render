@@ -17,11 +17,15 @@ const BUCKET_SCENES = 'generated-content';
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const activeJobs = new Set();
 
-// NEW: Helper to filter out image covers and only accept video files
 function isVideoUrl(url) {
     if (!url) return false;
-    const extension = url.split('.').pop().split('?')[0].toLowerCase();
-    return ['mp4', 'webm', 'mov', 'm4v'].includes(extension);
+    const cleanUrl = url.split('?')[0].toLowerCase();
+    // If it's a known image format, it's definitely NOT a video
+    if (cleanUrl.endsWith('.png') || cleanUrl.endsWith('.jpg') || cleanUrl.endsWith('.jpeg') || cleanUrl.endsWith('.webp')) {
+        return false;
+    }
+    // If it has a video extension OR if it's a large file from ScVideo, we treat it as video
+    return cleanUrl.endsWith('.mp4') || cleanUrl.endsWith('.webm') || cleanUrl.endsWith('.mov') || !cleanUrl.includes('.');
 }
 
 function ensureFullUrl(input, bucket) {
@@ -70,41 +74,41 @@ function runFFmpeg(args) {
 }
 
 async function processJob(scriptId) {
-    if (!scriptId || activeJobs.has(scriptId)) return;
-    activeJobs.add(scriptId);
+    if (!activeJobs.has(scriptId)) activeJobs.add(scriptId); else return;
 
     try {
-        console.log(`[STRICT VIDEO MODE] Checking Script: ${scriptId}`);
+        console.log(`[DIAGNOSTICS] Starting Render for ID: ${scriptId}`);
         await supabase.from('story_script').update({ status: 'PROCESSING_RENDER', progress_percentage: "40" }).eq('id', scriptId);
 
         let job = null;
         let retries = 0;
         
-        // Wait longer (up to 30 mins) for actual video files to replace images
-        while (retries < 120) { 
+        while (retries < 150) { 
             const { data } = await supabase.from('story_script').select('*').eq('id', scriptId).single();
             let parsed = typeof data.script_data === 'string' ? JSON.parse(data.script_data) : data.script_data;
             
-            // IGNORE IMAGES: Only count scenes that have an ACTUAL video URL
-            const readyVideoClips = parsed?.scenes?.filter(s => isVideoUrl(s.video_url)) || [];
-            const totalTarget = parsed?.scenes?.length || 0;
+            const scenes = parsed?.scenes || [];
+            const readyVideoClips = scenes.filter(s => isVideoUrl(s.video_url));
             
-            if (readyVideoClips.length > 0 && readyVideoClips.length === totalTarget) {
+            // LOGGING THE ACTUAL URLS FOR YOU TO SEE IN RENDER
+            scenes.forEach((s, i) => {
+                console.log(`[SCENE ${i}] URL: ${s.video_url || 'EMPTY'} | IS_VIDEO: ${isVideoUrl(s.video_url)}`);
+            });
+
+            if (readyVideoClips.length > 0 && readyVideoClips.length === scenes.length) {
                 job = { ...data, parsed_data: parsed };
-                console.log(`[READY] All ${readyVideoClips.length} video files are confirmed.`);
                 break;
             }
             
-            console.log(`[WAITING] Found ${readyVideoClips.length}/${totalTarget} videos. (Waiting for AI to finish clips...)`);
+            console.log(`[WAITING] Found ${readyVideoClips.length}/${scenes.length} real videos. Checking again in 15s...`);
             await new Promise(r => setTimeout(r, 15000));
             retries++;
         }
 
-        if (!job) throw new Error("Timeout: The AI generated images but failed to provide actual videos.");
+        if (!job) throw new Error("Timeout: ScVideo did not finish the video clips in time.");
 
         const rawPaths = [];
         const sd = job.parsed_data;
-        
         const lPath = await downloadAsset(ensureFullUrl(sd?.logo_video, BUCKET_LOGOS), scriptId, 'logo');
         if (lPath) rawPaths.push(lPath);
 
@@ -114,29 +118,21 @@ async function processJob(scriptId) {
             if (sPath) rawPaths.push(sPath);
         }
 
-        const mUrl = ensureFullUrl(sd?.audio_engine?.moodTrack?.url, BUCKET_MUSIC);
-        const mPath = await downloadAsset(mUrl, scriptId, 'music', '.mp3');
+        const mPath = await downloadAsset(ensureFullUrl(sd?.audio_engine?.moodTrack?.url, BUCKET_MUSIC), scriptId, 'music', '.mp3');
 
         const processedPaths = [];
         for (let i = 0; i < rawPaths.length; i++) {
             const outP = rawPaths[i] + '.ts';
             const audioFound = await hasAudio(rawPaths[i]);
-            
-            let ffmpegArgs = [
-                '-i', rawPaths[i],
-                '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
-            ];
-
-            ffmpegArgs.push('-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v]${audioFound ? ';[0:a][1:a]amix=inputs=2:duration=first[a]' : ''}`);
-            
+            let filter = `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v]`;
+            let fArgs = ['-i', rawPaths[i], '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'];
             if (audioFound) {
-                ffmpegArgs.push('-map', '[v]', '-map', '[a]');
+                fArgs.push('-filter_complex', `${filter};[0:a][1:a]amix=inputs=2:duration=first[a]`, '-map', '[v]', '-map', '[a]');
             } else {
-                ffmpegArgs.push('-map', '[v]', '-map', '1:a');
+                fArgs.push('-filter_complex', filter, '-map', '[v]', '-map', '1:a');
             }
-
-            ffmpegArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', '-y', outP);
-            await runFFmpeg(ffmpegArgs);
+            fArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', '-y', outP);
+            await runFFmpeg(fArgs);
             processedPaths.push(outP);
         }
 
@@ -156,25 +152,17 @@ async function processJob(scriptId) {
         } else {
             finalArgs.push('-filter_complex', concatStr, '-map', '[vv]', '-map', '[aa]');
         }
-        
         finalArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-y', outPath);
         await runFFmpeg(finalArgs);
 
-        const videoBuf = await fs.readFile(outPath);
         const finalFileName = `story_${scriptId}_${Date.now()}.mp4`;
-        await supabase.storage.from(BUCKET_GENERATED).upload(finalFileName, videoBuf, { contentType: 'video/mp4' });
-
+        await supabase.storage.from(BUCKET_GENERATED).upload(finalFileName, await fs.readFile(outPath), { contentType: 'video/mp4' });
         const { data: pUrl } = supabase.storage.from(BUCKET_GENERATED).getPublicUrl(finalFileName);
         await supabase.from('story_script').update({ status: 'COMPLETED', final_video_url: pUrl.publicUrl, progress_percentage: "100" }).eq('id', scriptId);
 
-        console.log(`[SUCCESS] Full Video Rendered for ID ${scriptId}: ${pUrl.publicUrl}`);
-
-        for (const p of [...rawPaths, ...processedPaths]) await fs.unlink(p).catch(() => {});
-        if (mPath) await fs.unlink(mPath).catch(() => {});
-        await fs.unlink(outPath).catch(() => {});
-
+        for (const p of [...rawPaths, ...processedPaths, mPath, outPath].filter(Boolean)) await fs.unlink(p).catch(() => {});
     } catch (e) {
-        console.error(`[ERROR Script ${scriptId}]`, e.message);
+        console.error(`[ERROR]`, e.message);
         await supabase.from('story_script').update({ status: 'FAILED', error_message: e.message }).eq('id', scriptId);
     } finally {
         activeJobs.delete(scriptId);
@@ -188,4 +176,4 @@ app.post(['/render', '/process'], (req, res) => {
     res.status(202).json({ status: "accepted" });
     if (id) processJob(id);
 });
-app.listen(PORT, () => console.log(`Render Engine Online on Port ${PORT}`));
+app.listen(PORT, () => console.log(`Render Engine Online`));
