@@ -44,6 +44,22 @@ async function downloadAsset(url, scriptId, assetName, ext = '.mp4') {
     return null;
 }
 
+// Helper to run FFmpeg commands reliably
+function runFFmpeg(args) {
+    return new Promise((resolve, reject) => {
+        const proc = spawn('ffmpeg', args);
+        let errData = '';
+        proc.stderr.on('data', (data) => { errData += data.toString(); });
+        proc.on('close', (code) => {
+            if (code === 0) resolve();
+            else {
+                console.error('[FFMPEG ERROR DETAILS]:', errData);
+                reject(new Error(`FFmpeg exit code ${code}`));
+            }
+        });
+    });
+}
+
 async function processJob(scriptId) {
     if (!scriptId || activeJobs.has(scriptId)) return;
     activeJobs.add(scriptId);
@@ -51,7 +67,6 @@ async function processJob(scriptId) {
     try {
         let job = null;
         let retries = 0;
-        
         while (retries < 30) {
             const { data } = await supabase.from('story_script').select('*').eq('id', scriptId).single();
             if (data && data.script_data) {
@@ -62,81 +77,88 @@ async function processJob(scriptId) {
                     break;
                 }
             }
-            console.log(`[WAIT] Waiting for scenes for ID ${scriptId}... (${retries}/30)`);
+            console.log(`[WAIT] Polling for scenes ID ${scriptId}... (${retries}/30)`);
             await new Promise(r => setTimeout(r, 4000));
             retries++;
         }
 
-        if (!job) throw new Error("Timed out waiting for scenes in script_data");
+        if (!job) throw new Error("No scenes found in database");
 
-        console.log(`[JOB] Starting render for ID: ${scriptId}`);
         await supabase.from('story_script').update({ status: 'PROCESSING_RENDER', progress_percentage: "40" }).eq('id', scriptId);
 
-        const videoPaths = [];
+        const rawPaths = [];
         const sd = job.parsed_data;
         
         const lPath = await downloadAsset(ensureFullUrl(sd?.logo_video, BUCKET_LOGOS), scriptId, 'logo');
-        if (lPath) videoPaths.push(lPath);
+        if (lPath) rawPaths.push(lPath);
 
-        if (sd?.scenes && Array.isArray(sd.scenes)) {
+        if (sd?.scenes) {
             for (let i = 0; i < sd.scenes.length; i++) {
                 const sUrl = ensureFullUrl(sd.scenes[i].video_url, BUCKET_SCENES);
                 const sPath = await downloadAsset(sUrl, scriptId, `scene_${i}`);
-                if (sPath) videoPaths.push(sPath);
+                if (sPath) rawPaths.push(sPath);
             }
         }
-
-        if (videoPaths.length === 0) throw new Error("No video scenes found to stitch.");
 
         const mUrl = ensureFullUrl(sd?.audio_engine?.moodTrack?.url, BUCKET_MUSIC);
         const mPath = await downloadAsset(mUrl, scriptId, 'music', '.mp3');
 
-        const outPath = path.join('/tmp', `output_${scriptId}.mp4`);
-        
-        let filter = "";
-        let inputArgs = [];
-        videoPaths.forEach((p, idx) => {
-            inputArgs.push('-i', p);
-            filter += `[${idx}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v${idx}];`;
-            filter += `[${idx}:a]anullsrc=r=44100:cl=stereo[a${idx}_silent];[${idx}:a][a${idx}_silent]amix=inputs=1:duration=first[a${idx}];`;
-        });
-        
-        const videoNodes = videoPaths.map((_, i) => `[v${i}]`).join('');
-        const audioNodes = videoPaths.map((_, i) => `[a${i}]`).join('');
-        filter += `${videoNodes}${audioNodes}concat=n=${videoPaths.length}:v=1:a=1[v_out][a_out]`;
-
-        let args = [...inputArgs];
-        if (mPath) {
-            args.push('-i', mPath);
-            filter += `;[a_out][${videoPaths.length}:a]amix=inputs=2:duration=first[final_a]`;
-            args.push('-filter_complex', filter, '-map', '[v_out]', '-map', '[final_a]');
-        } else {
-            args.push('-filter_complex', filter, '-map', '[v_out]', '-map', '[a_out]');
+        // --- THE FIX: PRE-PROCESS EVERY CLIP TO BE IDENTICAL ---
+        const processedPaths = [];
+        console.log(`[FFMPEG] Standardizing ${rawPaths.length} clips...`);
+        for (let i = 0; i < rawPaths.length; i++) {
+            const outP = rawPaths[i] + '_std.mp4';
+            // Force resolution, framerate, pixel format, and silent audio if missing
+            await runFFmpeg([
+                '-i', rawPaths[i],
+                '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25',
+                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+                '-c:a', 'aac', '-shortest', '-map', '0:v', '-map', '1:a',
+                '-y', outP
+            ]);
+            processedPaths.push(outP);
         }
 
-        args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-y', outPath);
-
-        console.log(`[FFMPEG] Starting concatenation...`);
-        await new Promise((resolve, reject) => {
-            const proc = spawn('ffmpeg', args);
-            proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`FFmpeg error ${code}`)));
+        // --- NOW CONCAT THE CLEAN CLIPS ---
+        const outPath = path.join('/tmp', `final_output_${scriptId}.mp4`);
+        let concatFilter = "";
+        let inputArgs = [];
+        processedPaths.forEach((p, idx) => {
+            inputArgs.push('-i', p);
+            concatFilter += `[${idx}:v][${idx}:a]`;
         });
+        concatFilter += `concat=n=${processedPaths.length}:v=1:a=1[v][a]`;
+
+        let finalArgs = [...inputArgs];
+        if (mPath) {
+            finalArgs.push('-i', mPath);
+            // Mix standardized audio with music
+            finalArgs.push('-filter_complex', `${concatFilter};[a][${processedPaths.length}:a]amix=inputs=2:duration=first[fa]`, '-map', '[v]', '-map', '[fa]');
+        } else {
+            finalArgs.push('-filter_complex', concatFilter, '-map', '[v]', '-map', '[a]');
+        }
+        
+        finalArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-y', outPath);
+
+        console.log(`[FFMPEG] Stitching final movie...`);
+        await runFFmpeg(finalArgs);
 
         const videoBuf = await fs.readFile(outPath);
         const finalFileName = `final_${scriptId}_${Date.now()}.mp4`;
         await supabase.storage.from(BUCKET_GENERATED).upload(finalFileName, videoBuf, { contentType: 'video/mp4' });
 
         const { data: pUrl } = supabase.storage.from(BUCKET_GENERATED).getPublicUrl(finalFileName);
-        
         await supabase.from('story_script').update({ 
             status: 'COMPLETED', 
             final_video_url: pUrl.publicUrl, 
             progress_percentage: "100" 
         }).eq('id', scriptId);
 
-        console.log(`[SUCCESS] Generated: ${pUrl.publicUrl}`);
+        console.log(`[SUCCESS] Movie: ${pUrl.publicUrl}`);
 
-        for (const p of videoPaths) await fs.unlink(p).catch(() => {});
+        // Cleanup everything
+        for (const p of [...rawPaths, ...processedPaths]) await fs.unlink(p).catch(() => {});
         if (mPath) await fs.unlink(mPath).catch(() => {});
         await fs.unlink(outPath).catch(() => {});
 
@@ -150,14 +172,9 @@ async function processJob(scriptId) {
 
 const app = express();
 app.use(express.json());
-
 app.post(['/render', '/process'], (req, res) => {
     const id = req.body?.id || req.body?.record?.id || req.body?.scriptId || req.body?.payload?.id;
-    console.log(`[INCOMING] ID: ${id}`);
     res.status(202).json({ status: "accepted", id });
     if (id) processJob(id);
 });
-
-app.listen(PORT, () => {
-    console.log(`Render Engine Online | Port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Render Engine Online | Port ${PORT}`));
