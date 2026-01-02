@@ -102,18 +102,18 @@ async function processJob(scriptId) {
         const mUrl = ensureFullUrl(sd?.audio_engine?.moodTrack?.url, BUCKET_MUSIC);
         const mPath = await downloadAsset(mUrl, scriptId, 'music', '.mp3');
 
-        // --- STEP 1: CONVERT ALL TO IDENTICAL TS FILES (MOST RELIABLE METHOD) ---
+        // --- STEP 1: STANDARDIZE ---
         const processedPaths = [];
         console.log(`[FFMPEG] Standardizing ${rawPaths.length} clips...`);
         for (let i = 0; i < rawPaths.length; i++) {
             const outP = rawPaths[i] + '.ts';
-            // Correct order: Input -> Filter Complex -> Output
             await runFFmpeg([
                 '-i', rawPaths[i],
                 '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-                '-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v];[0:a][1:a]amix=inputs=1:duration=first[a]`,
-                '-map', '[v]', '-map', '[a]',
+                '-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v]`,
+                '-map', '[v]', '-map', '1:a',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-shortest',
                 '-y', outP
             ]);
             processedPaths.push(outP);
