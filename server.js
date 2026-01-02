@@ -17,6 +17,13 @@ const BUCKET_SCENES = 'generated-content';
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const activeJobs = new Set();
 
+// NEW: Helper to filter out image covers and only accept video files
+function isVideoUrl(url) {
+    if (!url) return false;
+    const extension = url.split('.').pop().split('?')[0].toLowerCase();
+    return ['mp4', 'webm', 'mov', 'm4v'].includes(extension);
+}
+
 function ensureFullUrl(input, bucket) {
     if (!input || input === "null" || input === "") return null;
     let str = String(input);
@@ -67,28 +74,33 @@ async function processJob(scriptId) {
     activeJobs.add(scriptId);
 
     try {
-        console.log(`[STORY MODE] Processing Script: ${scriptId}`);
+        console.log(`[STRICT VIDEO MODE] Checking Script: ${scriptId}`);
         await supabase.from('story_script').update({ status: 'PROCESSING_RENDER', progress_percentage: "40" }).eq('id', scriptId);
 
         let job = null;
         let retries = 0;
         
-        while (retries < 90) { 
+        // Wait longer (up to 30 mins) for actual video files to replace images
+        while (retries < 120) { 
             const { data } = await supabase.from('story_script').select('*').eq('id', scriptId).single();
             let parsed = typeof data.script_data === 'string' ? JSON.parse(data.script_data) : data.script_data;
-            const readyClips = parsed?.scenes?.filter(s => s.video_url) || [];
             
-            if (readyClips.length > 0 && readyClips.length === (parsed?.scenes?.length || 0)) {
+            // IGNORE IMAGES: Only count scenes that have an ACTUAL video URL
+            const readyVideoClips = parsed?.scenes?.filter(s => isVideoUrl(s.video_url)) || [];
+            const totalTarget = parsed?.scenes?.length || 0;
+            
+            if (readyVideoClips.length > 0 && readyVideoClips.length === totalTarget) {
                 job = { ...data, parsed_data: parsed };
-                console.log(`[READY] All ${readyClips.length} scenes found.`);
+                console.log(`[READY] All ${readyVideoClips.length} video files are confirmed.`);
                 break;
             }
-            console.log(`[WAITING] AI is generating clips (${readyClips.length}/${parsed?.scenes?.length || '?'})...`);
-            await new Promise(r => setTimeout(r, 10000));
+            
+            console.log(`[WAITING] Found ${readyVideoClips.length}/${totalTarget} videos. (Waiting for AI to finish clips...)`);
+            await new Promise(r => setTimeout(r, 15000));
             retries++;
         }
 
-        if (!job) throw new Error("Processing timeout or no clips found.");
+        if (!job) throw new Error("Timeout: The AI generated images but failed to provide actual videos.");
 
         const rawPaths = [];
         const sd = job.parsed_data;
@@ -96,9 +108,9 @@ async function processJob(scriptId) {
         const lPath = await downloadAsset(ensureFullUrl(sd?.logo_video, BUCKET_LOGOS), scriptId, 'logo');
         if (lPath) rawPaths.push(lPath);
 
-        const scenes = sd.scenes.filter(s => s.video_url);
-        for (let i = 0; i < scenes.length; i++) {
-            const sPath = await downloadAsset(ensureFullUrl(scenes[i].video_url, BUCKET_SCENES), scriptId, `scene_${i}`);
+        const videoScenes = sd.scenes.filter(s => isVideoUrl(s.video_url));
+        for (let i = 0; i < videoScenes.length; i++) {
+            const sPath = await downloadAsset(ensureFullUrl(videoScenes[i].video_url, BUCKET_SCENES), scriptId, `scene_${i}`);
             if (sPath) rawPaths.push(sPath);
         }
 
@@ -115,10 +127,11 @@ async function processJob(scriptId) {
                 '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
             ];
 
+            ffmpegArgs.push('-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v]${audioFound ? ';[0:a][1:a]amix=inputs=2:duration=first[a]' : ''}`);
+            
             if (audioFound) {
-                ffmpegArgs.push('-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v];[0:a][1:a]amix=inputs=2:duration=first[a]`);
+                ffmpegArgs.push('-map', '[v]', '-map', '[a]');
             } else {
-                ffmpegArgs.push('-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v]`);
                 ffmpegArgs.push('-map', '[v]', '-map', '1:a');
             }
 
@@ -154,7 +167,7 @@ async function processJob(scriptId) {
         const { data: pUrl } = supabase.storage.from(BUCKET_GENERATED).getPublicUrl(finalFileName);
         await supabase.from('story_script').update({ status: 'COMPLETED', final_video_url: pUrl.publicUrl, progress_percentage: "100" }).eq('id', scriptId);
 
-        console.log(`[SUCCESS] Full Movie Ready: ${pUrl.publicUrl}`);
+        console.log(`[SUCCESS] Full Video Rendered for ID ${scriptId}: ${pUrl.publicUrl}`);
 
         for (const p of [...rawPaths, ...processedPaths]) await fs.unlink(p).catch(() => {});
         if (mPath) await fs.unlink(mPath).catch(() => {});
