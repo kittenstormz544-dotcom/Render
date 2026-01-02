@@ -44,7 +44,6 @@ async function downloadAsset(url, scriptId, assetName, ext = '.mp4') {
     return null;
 }
 
-// Helper to run FFmpeg commands reliably
 function runFFmpeg(args) {
     return new Promise((resolve, reject) => {
         const proc = spawn('ffmpeg', args);
@@ -103,24 +102,24 @@ async function processJob(scriptId) {
         const mUrl = ensureFullUrl(sd?.audio_engine?.moodTrack?.url, BUCKET_MUSIC);
         const mPath = await downloadAsset(mUrl, scriptId, 'music', '.mp3');
 
-        // --- THE FIX: PRE-PROCESS EVERY CLIP TO BE IDENTICAL ---
+        // --- STEP 1: CONVERT ALL TO IDENTICAL TS FILES (MOST RELIABLE METHOD) ---
         const processedPaths = [];
         console.log(`[FFMPEG] Standardizing ${rawPaths.length} clips...`);
         for (let i = 0; i < rawPaths.length; i++) {
-            const outP = rawPaths[i] + '_std.mp4';
-            // Force resolution, framerate, pixel format, and silent audio if missing
+            const outP = rawPaths[i] + '.ts';
+            // Correct order: Input -> Filter Complex -> Output
             await runFFmpeg([
                 '-i', rawPaths[i],
-                '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25',
-                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                 '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-                '-c:a', 'aac', '-shortest', '-map', '0:v', '-map', '1:a',
+                '-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v];[0:a][1:a]amix=inputs=1:duration=first[a]`,
+                '-map', '[v]', '-map', '[a]',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
                 '-y', outP
             ]);
             processedPaths.push(outP);
         }
 
-        // --- NOW CONCAT THE CLEAN CLIPS ---
+        // --- STEP 2: STITCH ---
         const outPath = path.join('/tmp', `final_output_${scriptId}.mp4`);
         let concatFilter = "";
         let inputArgs = [];
@@ -133,7 +132,6 @@ async function processJob(scriptId) {
         let finalArgs = [...inputArgs];
         if (mPath) {
             finalArgs.push('-i', mPath);
-            // Mix standardized audio with music
             finalArgs.push('-filter_complex', `${concatFilter};[a][${processedPaths.length}:a]amix=inputs=2:duration=first[fa]`, '-map', '[v]', '-map', '[fa]');
         } else {
             finalArgs.push('-filter_complex', concatFilter, '-map', '[v]', '-map', '[a]');
@@ -157,7 +155,6 @@ async function processJob(scriptId) {
 
         console.log(`[SUCCESS] Movie: ${pUrl.publicUrl}`);
 
-        // Cleanup everything
         for (const p of [...rawPaths, ...processedPaths]) await fs.unlink(p).catch(() => {});
         if (mPath) await fs.unlink(mPath).catch(() => {});
         await fs.unlink(outPath).catch(() => {});
