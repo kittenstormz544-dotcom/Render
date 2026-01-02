@@ -39,11 +39,10 @@ async function downloadAsset(url, scriptId, assetName, ext = '.mp4') {
     return null;
 }
 
-// New helper to check if a file has an audio stream
 function hasAudio(filePath) {
     return new Promise((resolve) => {
         exec(`ffprobe -v error -show_streams -select_streams a "${filePath}"`, (err, stdout) => {
-            resolve(!!stdout);
+            resolve(!!stdout && stdout.trim().length > 0);
         });
     });
 }
@@ -75,15 +74,15 @@ async function processJob(scriptId) {
 
         let job = initialJob;
         let retries = 0;
-        while (retries < 30) {
+        while (retries < 40) { 
             const { data } = await supabase.from('story_script').select('*').eq('id', scriptId).single();
             let parsed = typeof data.script_data === 'string' ? JSON.parse(data.script_data) : data.script_data;
             if (parsed && parsed.scenes && parsed.scenes.length > 0 && parsed.scenes.every(s => s.video_url)) {
                 job = { ...data, parsed_data: parsed };
                 break;
             }
-            console.log(`[WAIT] Waiting for scene URLs for ID ${scriptId}...`);
-            await new Promise(r => setTimeout(r, 5000));
+            console.log(`[WAIT] Waiting for all video clips to be ready in Supabase...`);
+            await new Promise(r => setTimeout(r, 6000));
             retries++;
         }
 
@@ -104,26 +103,23 @@ async function processJob(scriptId) {
         const processedPaths = [];
         for (let i = 0; i < rawPaths.length; i++) {
             const outP = rawPaths[i] + '.ts';
-            const audioExists = await hasAudio(rawPaths[i]);
-            console.log(`[FFMPEG] Standardizing clip ${i} (Has Audio: ${audioExists})...`);
-            
-            let filter;
-            if (audioExists) {
-                // Mix existing audio with silence (to ensure no gaps)
-                filter = `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v];[0:a][1:a]amix=inputs=2:duration=first[a]`;
+            const audioFound = await hasAudio(rawPaths[i]);
+            console.log(`[FFMPEG] Standardizing clip ${i} (Audio detected: ${audioFound})`);
+
+            let ffmpegArgs = [
+                '-i', rawPaths[i],
+                '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'
+            ];
+
+            if (audioFound) {
+                ffmpegArgs.push('-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v];[0:a][1:a]amix=inputs=2:duration=first[a]`);
             } else {
-                // No audio in source? Just use the silence
-                filter = `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v];[1:a]anullfilter[a]`;
+                ffmpegArgs.push('-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v]`);
+                ffmpegArgs.push('-map', '[v]', '-map', '1:a');
             }
 
-            await runFFmpeg([
-                '-i', rawPaths[i],
-                '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-                '-filter_complex', filter,
-                '-map', '[v]', '-map', '[a]',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-t', '10', // Safety timeout
-                '-y', outP
-            ]);
+            ffmpegArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', '-y', outP);
+            await runFFmpeg(ffmpegArgs);
             processedPaths.push(outP);
         }
 
@@ -139,7 +135,7 @@ async function processJob(scriptId) {
         let finalArgs = [...inputArgs];
         if (mPath) {
             finalArgs.push('-i', mPath);
-            finalArgs.push('-filter_complex', `${concatStr};[aa][${processedPaths.length}:a]amix=inputs=2:duration=first[fa]`, '-map', '[vv]', '-map', '[fa]');
+            finalArgs.push('-filter_complex', `${concatStr};[aa]volume=1.0[v1];[${processedPaths.length}:a]volume=0.3[v2];[v1][v2]amix=inputs=2:duration=first[fa]`, '-map', '[vv]', '-map', '[fa]');
         } else {
             finalArgs.push('-filter_complex', concatStr, '-map', '[vv]', '-map', '[aa]');
         }
@@ -154,7 +150,7 @@ async function processJob(scriptId) {
         const { data: pUrl } = supabase.storage.from(BUCKET_GENERATED).getPublicUrl(finalFileName);
         await supabase.from('story_script').update({ status: 'COMPLETED', final_video_url: pUrl.publicUrl, progress_percentage: "100" }).eq('id', scriptId);
 
-        console.log(`[SUCCESS] Full Video: ${pUrl.publicUrl}`);
+        console.log(`[SUCCESS] Full Length Video Ready: ${pUrl.publicUrl}`);
 
         for (const p of [...rawPaths, ...processedPaths]) await fs.unlink(p).catch(() => {});
         if (mPath) await fs.unlink(mPath).catch(() => {});
@@ -175,4 +171,4 @@ app.post(['/render', '/process'], (req, res) => {
     res.status(202).json({ status: "accepted" });
     if (id) processJob(id);
 });
-app.listen(PORT, () => console.log(`Online on ${PORT}`));
+app.listen(PORT, () => console.log(`Render Engine Online on Port ${PORT}`));
