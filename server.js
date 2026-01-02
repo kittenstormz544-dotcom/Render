@@ -1,6 +1,6 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
-const { spawn } = require('child_process'); 
+const { spawn, exec } = require('child_process'); 
 const { promises: fs } = require('fs'); 
 const path = require('path');
 const fetch = require('node-fetch'); 
@@ -39,6 +39,15 @@ async function downloadAsset(url, scriptId, assetName, ext = '.mp4') {
     return null;
 }
 
+// New helper to check if a file has an audio stream
+function hasAudio(filePath) {
+    return new Promise((resolve) => {
+        exec(`ffprobe -v error -show_streams -select_streams a "${filePath}"`, (err, stdout) => {
+            resolve(!!stdout);
+        });
+    });
+}
+
 function runFFmpeg(args) {
     return new Promise((resolve, reject) => {
         const proc = spawn('ffmpeg', args);
@@ -69,7 +78,7 @@ async function processJob(scriptId) {
         while (retries < 30) {
             const { data } = await supabase.from('story_script').select('*').eq('id', scriptId).single();
             let parsed = typeof data.script_data === 'string' ? JSON.parse(data.script_data) : data.script_data;
-            if (parsed && parsed.scenes && parsed.scenes.length > 0) {
+            if (parsed && parsed.scenes && parsed.scenes.length > 0 && parsed.scenes.every(s => s.video_url)) {
                 job = { ...data, parsed_data: parsed };
                 break;
             }
@@ -92,23 +101,32 @@ async function processJob(scriptId) {
         const mUrl = ensureFullUrl(sd?.audio_engine?.moodTrack?.url, BUCKET_MUSIC);
         const mPath = await downloadAsset(mUrl, scriptId, 'music', '.mp3');
 
-        // --- STANDARDIZE WITHOUT CLIPPING ---
         const processedPaths = [];
         for (let i = 0; i < rawPaths.length; i++) {
             const outP = rawPaths[i] + '.ts';
-            console.log(`[FFMPEG] Standardizing clip ${i}...`);
+            const audioExists = await hasAudio(rawPaths[i]);
+            console.log(`[FFMPEG] Standardizing clip ${i} (Has Audio: ${audioExists})...`);
+            
+            let filter;
+            if (audioExists) {
+                // Mix existing audio with silence (to ensure no gaps)
+                filter = `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v];[0:a][1:a]amix=inputs=2:duration=first[a]`;
+            } else {
+                // No audio in source? Just use the silence
+                filter = `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v];[1:a]anullfilter[a]`;
+            }
+
             await runFFmpeg([
                 '-i', rawPaths[i],
                 '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-                '-filter_complex', `[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25,format=yuv420p[v];[0:a][1:a]amix=inputs=2:duration=first[a]`,
+                '-filter_complex', filter,
                 '-map', '[v]', '-map', '[a]',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-t', '10', // Safety timeout
                 '-y', outP
             ]);
             processedPaths.push(outP);
         }
 
-        // --- STITCH EVERYTHING ---
         const outPath = path.join('/tmp', `final_${scriptId}.mp4`);
         let concatStr = "";
         let inputArgs = [];
