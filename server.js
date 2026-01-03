@@ -20,6 +20,16 @@ function ensureFullUrl(input, bucket = 'generated-content') {
     return `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${str.replace(/^\/+/, '')}`;
 }
 
+// Check if a video actually has an audio stream
+function hasAudio(filePath) {
+    return new Promise((resolve) => {
+        exec(`ffprobe -v error -show_streams -select_streams a "${filePath}"`, (err, stdout) => {
+            if (err) return resolve(false);
+            resolve(!!stdout && stdout.trim().length > 0);
+        });
+    });
+}
+
 async function runFFmpeg(args) {
     return new Promise((resolve, reject) => {
         const proc = spawn('ffmpeg', args);
@@ -45,7 +55,7 @@ async function processJob(scriptId) {
             const scene = scenes[i];
             if (!scene.video_url) continue;
 
-            console.log(`[SCENE ${i}] Preparing synced clip...`);
+            console.log(`[SCENE ${i}] Verifying stream...`);
             const videoUrl = ensureFullUrl(scene.video_url);
             const res = await fetch(videoUrl);
             const tempIn = path.join('/tmp', `in_${i}_${scriptId}.mp4`);
@@ -53,13 +63,28 @@ async function processJob(scriptId) {
             
             await fs.writeFile(tempIn, Buffer.from(await res.arrayBuffer()));
 
-            // Safety Filters: Scaling, Padding, and Audio Normalization
+            // FIXED: Check if audio exists so we don't crash the filtergraph
+            const audioExists = await hasAudio(tempIn);
+            console.log(`[SCENE ${i}] Audio present: ${audioExists}`);
+
+            let filterComplex = '';
+            let mapArgs = [];
+
+            if (audioExists) {
+                // Mix existing audio with silent baseline for safety
+                filterComplex = '[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24[v];[0:a][1:a]amix=inputs=2:duration=first[a]';
+                mapArgs = ['-map', '[v]', '-map', '[a]'];
+            } else {
+                // No audio in file? Use the silent generator purely
+                filterComplex = '[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24[v]';
+                mapArgs = ['-map', '[v]', '-map', '1:a'];
+            }
+
             await runFFmpeg([
                 '-i', tempIn,
                 '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-                '-filter_complex', 
-                '[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24[v];[0:a][1:a]amix=inputs=2:duration=first[a]',
-                '-map', '[v]', '-map', '[a]',
+                '-filter_complex', filterComplex,
+                ...mapArgs,
                 '-c:v', 'libx264', '-preset', 'ultrafast',
                 '-c:a', 'aac', '-ar', '44100',
                 '-f', 'mpegts', '-y', outTs
@@ -67,12 +92,12 @@ async function processJob(scriptId) {
             processedPaths.push(outTs);
         }
 
-        if (processedPaths.length === 0) throw new Error("No valid video scenes found to render.");
+        if (processedPaths.length === 0) throw new Error("No scenes were processed.");
 
         const finalPath = path.join('/tmp', `final_${scriptId}.mp4`);
         const concatString = `concat:${processedPaths.join('|')}`;
 
-        console.log(`[STITCHING] Joining ${processedPaths.length} scenes...`);
+        console.log(`[STITCHING] Final assembly...`);
         await runFFmpeg([
             '-i', concatString,
             '-c', 'copy', 
@@ -92,7 +117,6 @@ async function processJob(scriptId) {
 
         console.log(`[SUCCESS] Master Movie ready: ${pUrl.publicUrl}`);
 
-        // Cleanup temp files
         for (const p of processedPaths) await fs.unlink(p).catch(() => {});
         await fs.unlink(finalPath).catch(() => {});
 
